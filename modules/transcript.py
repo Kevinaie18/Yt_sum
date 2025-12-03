@@ -7,12 +7,31 @@ Handles fetching transcripts from YouTube videos using youtube-transcript-api.
 import re
 from typing import Optional, Tuple
 from youtube_transcript_api import YouTubeTranscriptApi
-from youtube_transcript_api._errors import (
-    TranscriptsDisabled,
-    NoTranscriptFound,
-    VideoUnavailable,
-    NoTranscriptAvailable,
-)
+
+# Import exceptions - handle different package versions
+try:
+    # Newer versions (0.6.3+)
+    from youtube_transcript_api._errors import (
+        TranscriptsDisabled,
+        NoTranscriptFound,
+        VideoUnavailable,
+        NoTranscriptAvailable,
+    )
+except ImportError:
+    try:
+        # Alternative import path
+        from youtube_transcript_api import (
+            TranscriptsDisabled,
+            NoTranscriptFound,
+            VideoUnavailable,
+            NoTranscriptAvailable,
+        )
+    except ImportError:
+        # Fallback: define as generic exceptions
+        TranscriptsDisabled = Exception
+        NoTranscriptFound = Exception
+        VideoUnavailable = Exception
+        NoTranscriptAvailable = Exception
 
 
 def extract_video_id(url: str) -> Optional[str]:
