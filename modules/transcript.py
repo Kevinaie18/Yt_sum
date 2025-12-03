@@ -1,7 +1,8 @@
 """
 YouTube Transcript Extraction Module
 
-Handles fetching transcripts from YouTube videos using youtube-transcript-api.
+Handles fetching transcripts from YouTube videos using youtube-transcript-api v1.2.3+.
+Uses the modern API with FetchedTranscript objects.
 """
 
 import re
@@ -9,9 +10,8 @@ import time
 from typing import Optional, Tuple
 from youtube_transcript_api import YouTubeTranscriptApi
 
-# Import exceptions - handle different package versions
+# Import exceptions for error handling
 try:
-    # Newer versions (0.6.3+)
     from youtube_transcript_api._errors import (
         TranscriptsDisabled,
         NoTranscriptFound,
@@ -20,7 +20,6 @@ try:
     )
 except ImportError:
     try:
-        # Alternative import path
         from youtube_transcript_api import (
             TranscriptsDisabled,
             NoTranscriptFound,
@@ -105,7 +104,7 @@ def validate_youtube_url(url: str) -> Tuple[bool, str, Optional[str]]:
 
 def fetch_transcript(video_id: str, languages: list = None, max_retries: int = 3) -> Tuple[bool, str, Optional[str]]:
     """
-    Fetch the transcript for a YouTube video with retry logic.
+    Fetch the transcript for a YouTube video using the modern API (v1.2.3+).
     
     Args:
         video_id: YouTube video ID
@@ -118,68 +117,77 @@ def fetch_transcript(video_id: str, languages: list = None, max_retries: int = 3
     if languages is None:
         languages = ['en', 'en-US', 'en-GB']
     
+    # Create API instance
+    ytt_api = YouTubeTranscriptApi()
+    
     last_error = None
     
     for attempt in range(max_retries):
         try:
-            # Try to get transcript in preferred languages
-            transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
-            
-            transcript = None
-            
-            # First, try to find a manual transcript in preferred languages
+            # Try direct fetch first (simplest method)
             try:
-                transcript = transcript_list.find_manually_created_transcript(languages)
+                fetched_transcript = ytt_api.fetch(video_id, languages=languages)
+                
+                # Extract text from snippets
+                full_text = " ".join([snippet.text for snippet in fetched_transcript])
+                
+                # Clean up the text (remove multiple spaces, normalize)
+                full_text = re.sub(r'\s+', ' ', full_text).strip()
+                
+                return True, f"Transcript fetched successfully ({len(full_text):,} characters).", full_text
+                
             except NoTranscriptFound:
+                # If direct fetch fails, try listing available transcripts
                 pass
             except Exception as e:
-                # Handle XML parsing errors and other transient errors
-                if "no element found" in str(e).lower() or "xml" in str(e).lower():
+                error_str = str(e).lower()
+                if "no element found" in error_str or "xml" in error_str:
                     if attempt < max_retries - 1:
                         time.sleep(2 ** attempt)  # Exponential backoff
                         continue
+                    return False, "YouTube returned an invalid response. Please try again in a few moments.", None
                 raise
             
-            # If no manual transcript, try auto-generated
-            if transcript is None:
+            # Fallback: List available transcripts and find one
+            try:
+                transcript_list = ytt_api.list(video_id)
+                
+                transcript = None
+                
+                # Try to find a transcript in preferred languages
                 try:
-                    transcript = transcript_list.find_generated_transcript(languages)
+                    transcript = transcript_list.find_transcript(languages)
                 except NoTranscriptFound:
                     pass
-                except Exception as e:
-                    if "no element found" in str(e).lower() or "xml" in str(e).lower():
-                        if attempt < max_retries - 1:
-                            time.sleep(2 ** attempt)
-                            continue
-                    raise
-            
-            # If still nothing, get any available transcript and translate if possible
-            if transcript is None:
-                try:
-                    # Get the first available transcript
+                
+                # If no transcript in preferred languages, get any available and translate
+                if transcript is None:
                     available = list(transcript_list)
                     if available:
+                        # Get the first available transcript
                         transcript = available[0]
                         # Try to translate to English if it's not in English
-                        if transcript.language_code not in languages:
+                        if transcript.language_code not in languages and transcript.is_translatable:
                             try:
                                 transcript = transcript.translate('en')
                             except Exception:
                                 # Use original if translation fails
                                 pass
-                except Exception as e:
-                    if "no element found" in str(e).lower() or "xml" in str(e).lower():
-                        if attempt < max_retries - 1:
-                            time.sleep(2 ** attempt)
-                            continue
-                    pass
-            
-            if transcript is None:
-                return False, "No transcript available for this video.", None
-            
-            # Fetch the actual transcript data
-            try:
-                transcript_data = transcript.fetch()
+                
+                if transcript is None:
+                    return False, "No transcript available for this video.", None
+                
+                # Fetch the transcript data
+                fetched_transcript = transcript.fetch()
+                
+                # Extract text from snippets
+                full_text = " ".join([snippet.text for snippet in fetched_transcript])
+                
+                # Clean up the text
+                full_text = re.sub(r'\s+', ' ', full_text).strip()
+                
+                return True, f"Transcript fetched successfully ({len(full_text):,} characters).", full_text
+                
             except Exception as e:
                 error_str = str(e).lower()
                 if "no element found" in error_str or "xml" in error_str:
@@ -188,14 +196,6 @@ def fetch_transcript(video_id: str, languages: list = None, max_retries: int = 3
                         continue
                     return False, "YouTube returned an invalid response. Please try again in a few moments.", None
                 raise
-            
-            # Concatenate text, removing timestamps
-            full_text = " ".join([entry['text'] for entry in transcript_data])
-            
-            # Clean up the text (remove multiple spaces, normalize)
-            full_text = re.sub(r'\s+', ' ', full_text).strip()
-            
-            return True, f"Transcript fetched successfully ({len(full_text):,} characters).", full_text
             
         except TranscriptsDisabled:
             return False, "Transcripts are disabled for this video.", None
@@ -217,7 +217,7 @@ def fetch_transcript(video_id: str, languages: list = None, max_retries: int = 3
                     return False, "YouTube returned an invalid response. This may be temporary - please try again in a few moments.", None
             
             # Check for other known errors
-            if "Video unavailable" in error_msg:
+            if "Video unavailable" in error_msg or "unavailable" in error_msg.lower():
                 return False, "This video is unavailable (private, deleted, or region-restricted).", None
             
             # If it's the last attempt, return the error
@@ -248,4 +248,3 @@ def get_transcript(url: str) -> Tuple[bool, str, Optional[str], Optional[str]]:
     success, message, transcript = fetch_transcript(video_id)
     
     return success, message, transcript, video_id
-
