@@ -5,6 +5,7 @@ Handles fetching transcripts from YouTube videos using youtube-transcript-api.
 """
 
 import re
+import time
 from typing import Optional, Tuple
 from youtube_transcript_api import YouTubeTranscriptApi
 
@@ -102,13 +103,14 @@ def validate_youtube_url(url: str) -> Tuple[bool, str, Optional[str]]:
     return True, "Valid YouTube URL.", video_id
 
 
-def fetch_transcript(video_id: str, languages: list = None) -> Tuple[bool, str, Optional[str]]:
+def fetch_transcript(video_id: str, languages: list = None, max_retries: int = 3) -> Tuple[bool, str, Optional[str]]:
     """
-    Fetch the transcript for a YouTube video.
+    Fetch the transcript for a YouTube video with retry logic.
     
     Args:
         video_id: YouTube video ID
         languages: List of language codes to try (default: ['en', 'en-US', 'en-GB'])
+        max_retries: Maximum number of retry attempts
         
     Returns:
         Tuple of (success, message_or_error, transcript_text)
@@ -116,67 +118,114 @@ def fetch_transcript(video_id: str, languages: list = None) -> Tuple[bool, str, 
     if languages is None:
         languages = ['en', 'en-US', 'en-GB']
     
-    try:
-        # Try to get transcript in preferred languages
-        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
-        
-        transcript = None
-        
-        # First, try to find a manual transcript in preferred languages
+    last_error = None
+    
+    for attempt in range(max_retries):
         try:
-            transcript = transcript_list.find_manually_created_transcript(languages)
-        except NoTranscriptFound:
-            pass
-        
-        # If no manual transcript, try auto-generated
-        if transcript is None:
+            # Try to get transcript in preferred languages
+            transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+            
+            transcript = None
+            
+            # First, try to find a manual transcript in preferred languages
             try:
-                transcript = transcript_list.find_generated_transcript(languages)
+                transcript = transcript_list.find_manually_created_transcript(languages)
             except NoTranscriptFound:
                 pass
-        
-        # If still nothing, get any available transcript and translate if possible
-        if transcript is None:
+            except Exception as e:
+                # Handle XML parsing errors and other transient errors
+                if "no element found" in str(e).lower() or "xml" in str(e).lower():
+                    if attempt < max_retries - 1:
+                        time.sleep(2 ** attempt)  # Exponential backoff
+                        continue
+                raise
+            
+            # If no manual transcript, try auto-generated
+            if transcript is None:
+                try:
+                    transcript = transcript_list.find_generated_transcript(languages)
+                except NoTranscriptFound:
+                    pass
+                except Exception as e:
+                    if "no element found" in str(e).lower() or "xml" in str(e).lower():
+                        if attempt < max_retries - 1:
+                            time.sleep(2 ** attempt)
+                            continue
+                    raise
+            
+            # If still nothing, get any available transcript and translate if possible
+            if transcript is None:
+                try:
+                    # Get the first available transcript
+                    available = list(transcript_list)
+                    if available:
+                        transcript = available[0]
+                        # Try to translate to English if it's not in English
+                        if transcript.language_code not in languages:
+                            try:
+                                transcript = transcript.translate('en')
+                            except Exception:
+                                # Use original if translation fails
+                                pass
+                except Exception as e:
+                    if "no element found" in str(e).lower() or "xml" in str(e).lower():
+                        if attempt < max_retries - 1:
+                            time.sleep(2 ** attempt)
+                            continue
+                    pass
+            
+            if transcript is None:
+                return False, "No transcript available for this video.", None
+            
+            # Fetch the actual transcript data
             try:
-                # Get the first available transcript
-                available = list(transcript_list)
-                if available:
-                    transcript = available[0]
-                    # Try to translate to English if it's not in English
-                    if transcript.language_code not in languages:
-                        try:
-                            transcript = transcript.translate('en')
-                        except Exception:
-                            # Use original if translation fails
-                            pass
-            except Exception:
-                pass
-        
-        if transcript is None:
-            return False, "No transcript available for this video.", None
-        
-        # Fetch the actual transcript data
-        transcript_data = transcript.fetch()
-        
-        # Concatenate text, removing timestamps
-        full_text = " ".join([entry['text'] for entry in transcript_data])
-        
-        # Clean up the text (remove multiple spaces, normalize)
-        full_text = re.sub(r'\s+', ' ', full_text).strip()
-        
-        return True, f"Transcript fetched successfully ({len(full_text):,} characters).", full_text
-        
-    except TranscriptsDisabled:
-        return False, "Transcripts are disabled for this video.", None
-    except VideoUnavailable:
-        return False, "This video is unavailable (private, deleted, or region-restricted).", None
-    except NoTranscriptAvailable:
-        return False, "No transcript available for this video.", None
-    except Exception as e:
-        error_msg = str(e)
-        if "Video unavailable" in error_msg:
+                transcript_data = transcript.fetch()
+            except Exception as e:
+                error_str = str(e).lower()
+                if "no element found" in error_str or "xml" in error_str:
+                    if attempt < max_retries - 1:
+                        time.sleep(2 ** attempt)
+                        continue
+                    return False, "YouTube returned an invalid response. Please try again in a few moments.", None
+                raise
+            
+            # Concatenate text, removing timestamps
+            full_text = " ".join([entry['text'] for entry in transcript_data])
+            
+            # Clean up the text (remove multiple spaces, normalize)
+            full_text = re.sub(r'\s+', ' ', full_text).strip()
+            
+            return True, f"Transcript fetched successfully ({len(full_text):,} characters).", full_text
+            
+        except TranscriptsDisabled:
+            return False, "Transcripts are disabled for this video.", None
+        except VideoUnavailable:
             return False, "This video is unavailable (private, deleted, or region-restricted).", None
-        return False, f"Error fetching transcript: {error_msg}", None
+        except NoTranscriptAvailable:
+            return False, "No transcript available for this video.", None
+        except Exception as e:
+            error_msg = str(e)
+            last_error = error_msg
+            
+            # Check for XML parsing errors
+            if "no element found" in error_msg.lower() or "xml" in error_msg.lower():
+                if attempt < max_retries - 1:
+                    # Wait before retrying (exponential backoff)
+                    time.sleep(2 ** attempt)
+                    continue
+                else:
+                    return False, "YouTube returned an invalid response. This may be temporary - please try again in a few moments.", None
+            
+            # Check for other known errors
+            if "Video unavailable" in error_msg:
+                return False, "This video is unavailable (private, deleted, or region-restricted).", None
+            
+            # If it's the last attempt, return the error
+            if attempt == max_retries - 1:
+                return False, f"Error fetching transcript: {error_msg}", None
+    
+    # If we get here, all retries failed
+    return False, f"Failed to fetch transcript after {max_retries} attempts. Last error: {last_error}", None
 
 
 def get_transcript(url: str) -> Tuple[bool, str, Optional[str], Optional[str]]:
